@@ -9,9 +9,12 @@
 
 #include <map>
 #include <vector>
+#include <chrono>
 
 #include "atlas/functionspace.h"
 #include "atlas/grid.h"
+#include "atlas/grid/StructuredGrid.h"
+#include "atlas/grid/Spacing.h"
 
 #include "oops/base/GeometryData.h"
 #include "oops/util/FieldSetHelpers.h"
@@ -26,16 +29,38 @@
 #include "fv3jedi/State/State.h"
 #include "fv3jedi/Utilities/fv3jedi_vertical_remap.h"
 
+#include <cmath>
+#include <string>
+#include <algorithm>
+#include <sys/stat.h>
+#include "atlas/array.h"
+#include "atlas/field.h"
+
+#include <sstream>
+#include <unistd.h>  // getpid()
+#include <limits>
+
 namespace fv3jedi {
 // -------------------------------------------------------------------------------------------------
 static IOMaker<IOStructuredGrid> makerIOStructuredGrid_("structured grid");
 static IOMaker<IOStructuredGrid> makerIOAuxGrid_("auxgrid");
 // -------------------------------------------------------------------------------------------------
+static inline void nc_rc(const int return_code, const std::string & operation) {
+  if (return_code) {
+    ABORT("IOStructuredGrid netCDF operation \'" + operation + "\' failed with error: "
+          + nc_strerror(return_code));
+  }
+}
+
+
+// -------------------------------------------------------------------------------------------------
 IOStructuredGrid::IOStructuredGrid(const Geometry & geom, const Parameters_ & params)
-  : IOBase(geom, params.toConfiguration()), interpolator_(), geom_(geom),
-    gridStr_(""), params_(params), writeFunctionSpace_() {
+  : IOBase(geom, params.toConfiguration()), interpolator_(), interpolatorBack_(), geom_(geom),
+    gridStr_(""), params_(params), writeFunctionSpace_(), readFunctionSpace_() {
   util::Timer timer(classname(), "IOStructuredGrid");
   oops::Log::trace() << classname() << " constructor starting" << std::endl;
+
+  const std::string mode = (params_.mode.value() != boost::none) ? *params_.mode.value() : "write";
 
   // Create the Atlas structured grid
   // --------------------------------
@@ -84,12 +109,137 @@ IOStructuredGrid::IOStructuredGrid(const Geometry & geom, const Parameters_ & pa
   oops::GeometryData geomData(geom.functionSpace(), geom.fields(), geom.levelsAreTopDown(),
                               geom.getComm());
 
-  // Create a generic interpolator for converting to the structured grid
-  // -------------------------------------------------------------------
-  interpolator_.reset(new oops::GlobalInterpolator(params.toConfiguration(), geomData,
-                                                   *writeFunctionSpace_,
-                                                   geom.getComm()));
-  oops::Log::trace() << classname() << " constructor done" << std::endl;
+  // -------------------------
+  // WRITE-only mode
+  // -------------------------
+  if (mode == "write") {
+    // Create a generic interpolator for converting to the structured grid
+    // -------------------------------------------------------------------
+    interpolator_.reset(new oops::GlobalInterpolator(params.toConfiguration(),
+                                                     geomData,
+                                                     *writeFunctionSpace_,
+                                                     geom.getComm()));
+    oops::Log::trace() << classname() << " constructor done (write)" << std::endl;
+    return;
+  }
+
+  // -------------------------
+  // READ mode: build INPUT geometry from file
+  // -------------------------
+  if (params_.inputFilename.value() == boost::none) {
+    ABORT("IOStructuredGrid: mode is 'read' but no input filename specified");
+  }
+  const std::string inFile = *params_.inputFilename.value();
+
+  size_t nLat = 0, nLon = 0;
+  std::vector<double> file_lats;
+  std::vector<double> file_lons;
+
+  if (geom_.getComm().rank() == 0) {
+    int ncid;
+    nc_rc(nc_open(inFile.c_str(), NC_NOWRITE, &ncid), "nc_open " + inFile);
+
+    int dim_gridyt, dim_gridxt;
+    nc_rc(nc_inq_dimid(ncid, "grid_yt", &dim_gridyt), "nc_inq_dimid grid_yt");
+    nc_rc(nc_inq_dimlen(ncid, dim_gridyt, &nLat), "nc_inq_dimlen grid_yt");
+    nc_rc(nc_inq_dimid(ncid, "grid_xt", &dim_gridxt), "nc_inq_dimid grid_xt");
+    nc_rc(nc_inq_dimlen(ncid, dim_gridxt, &nLon), "nc_inq_dimlen grid_xt");
+
+    file_lats.resize(nLat);
+    file_lons.resize(nLon);
+
+    int var_gridyt, var_gridxt;
+    nc_rc(nc_inq_varid(ncid, "grid_yt", &var_gridyt), "nc_inq_varid grid_yt");
+    nc_rc(nc_get_var_double(ncid, var_gridyt, file_lats.data()), "nc_get_var_double grid_yt");
+
+    nc_rc(nc_inq_varid(ncid, "grid_xt", &var_gridxt), "nc_inq_varid grid_xt");
+    nc_rc(nc_get_var_double(ncid, var_gridxt, file_lons.data()), "nc_get_var_double grid_xt");
+
+    nc_rc(nc_close(ncid), "nc_close");
+
+    oops::Log::info() << "Input file grid: nLon=" << nLon << ", nLat=" << nLat << std::endl;
+  }
+
+  // Broadcast dims and coordinates
+  geom_.getComm().broadcast(nLat, 0);
+  geom_.getComm().broadcast(nLon, 0);
+  if (geom_.getComm().rank() != 0) {
+    file_lats.resize(nLat);
+    file_lons.resize(nLon);
+  }
+  geom_.getComm().broadcast(file_lats, 0);
+  geom_.getComm().broadcast(file_lons, 0);
+
+  // Use L-grid ONLY for indexing/distribution (NOT for geometry)
+  const std::string inputGridType = "L" + std::to_string(nLon) + "x" + std::to_string(nLat);
+  const atlas::Grid inputGrid(inputGridType);
+
+  // -----------------------------------------------------------------------------
+  // Build distributed structured FunctionSpace for the global file grid
+  // -----------------------------------------------------------------------------
+  atlas::grid::Partitioner partitioner("equal_regions");
+
+  // --- IMPORTANT: enable halo/ghosts so haloExchange is real and seam stencils exist ---
+  atlas_conf.set("halo", 2);
+
+  readFunctionSpace_.reset(new atlas::functionspace::StructuredColumns(inputGrid, partitioner, atlas_conf));
+
+  // --- Override lonlat using file grid_xt/grid_yt ---
+  atlas::FieldSet structuredAux;
+
+  atlas::Field lonlat = readFunctionSpace_->createField<double>(
+      atlas::option::name("lonlat") | atlas::option::variables(2));
+
+  auto lonlatView = atlas::array::make_view<double,2>(lonlat);
+  auto gidxView   = atlas::array::make_view<atlas::gidx_t,1>(readFunctionSpace_->global_index());
+  auto ghostView  = atlas::array::make_view<int,1>(readFunctionSpace_->ghost());
+
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  for (atlas::idx_t p = 0; p < lonlatView.shape(0); ++p) {
+    lonlatView(p,0) = nan;
+    lonlatView(p,1) = nan;
+  }
+
+  // owned fill
+  for (atlas::idx_t p = 0; p < lonlatView.shape(0); ++p) {
+    if (ghostView(p) != 0) continue;              // owned only
+    const auto gidx = gidxView(p);
+    if (gidx <= 0) continue;
+    const std::size_t g = static_cast<std::size_t>(gidx) - 1;
+    const std::size_t i = g % nLon;
+    const std::size_t j = g / nLon;
+    lonlatView(p,0) = file_lons[i];
+    lonlatView(p,1) = file_lats[j];               // flipLat already autodetected earlier in your version
+  }
+
+  // populate ghost lonlat consistently
+  readFunctionSpace_->haloExchange(lonlat);
+
+  structuredAux.add(lonlat);
+
+  oops::GeometryData structuredGeomData(*readFunctionSpace_,
+                                        structuredAux,
+                                        geom.levelsAreTopDown(),
+                                        geom.getComm());
+
+  // Reverse interpolator (structured -> model)
+  eckit::LocalConfiguration interpConfig = params.toConfiguration();
+  if (!interpConfig.has("local interpolator type")) {
+    interpConfig.set("local interpolator type", "oops unstructured grid interpolator");
+  }
+
+// Only create interpolator once
+if (!interpolatorBack_) {
+  interpolatorBack_.reset(new oops::GlobalInterpolator(interpConfig,
+                                                       structuredGeomData,
+                                                       geom.functionSpace(),
+                                                       geom.getComm()));
+  if (geom_.getComm().rank() == 0) {
+    oops::Log::info() << "Interpolator created (will be reused for all files)" << std::endl;
+  }
+}
+
+  oops::Log::trace() << classname() << " constructor done (" << mode << ")" << std::endl;
 }
 // -------------------------------------------------------------------------------------------------
 IOStructuredGrid::~IOStructuredGrid() {
@@ -99,14 +249,761 @@ IOStructuredGrid::~IOStructuredGrid() {
 }
 
 // -------------------------------------------------------------------------------------------------
+void IOStructuredGrid::loadAkBkOnce_(int nLevModel) const {
+  std::call_once(akbk_once_, [&]() {
+    const int rank = geom_.getComm().rank();
+    eckit::LocalConfiguration cfg = params_.toConfiguration();
+    const std::string coeffFile = *params_.akbk.value();
+    const size_t expect = static_cast<size_t>(nLevModel + 1);
+    int ncid;
+    nc_rc(nc_open(coeffFile.c_str(), NC_NOWRITE, &ncid), "nc_open " + coeffFile);
+    auto read_time_axis = [&](const char * varname, std::vector<double> & out) {
+      int varid;
+      nc_rc(nc_inq_varid(ncid, varname, &varid), std::string("nc_inq_varid ") + varname);
+      int ndims = 0;
+      nc_rc(nc_inq_varndims(ncid, varid, &ndims), std::string("nc_inq_varndims ") + varname);
+      if (ndims != 2) {
+        if (rank == 0) oops::Log::error() << varname << " is not 2D (Time,xaxis_1)" << std::endl;
+        ABORT(std::string(varname) + " wrong rank");
+      }
+      int dimids[NC_MAX_DIMS];
+      nc_rc(nc_inq_vardimid(ncid, varid, dimids), std::string("nc_inq_vardimid ") + varname);
+      size_t ntime = 0, naxis = 0;
+      nc_rc(nc_inq_dimlen(ncid, dimids[0], &ntime), std::string("nc_inq_dimlen Time for ") + varname);
+      nc_rc(nc_inq_dimlen(ncid, dimids[1], &naxis), std::string("nc_inq_dimlen xaxis_1 for ") + varname);
+      if (ntime < 1) ABORT(std::string(varname) + " has Time dim < 1");
+      if (naxis != expect) {
+        if (rank == 0) {
+          oops::Log::error() << varname << " axis length mismatch: expected "
+                             << expect << " got " << naxis << std::endl;
+        }
+        ABORT(std::string(varname) + " wrong axis length");
+      }
+      out.assign(expect, 0.0);
+      size_t start[2] = {0, 0};
+      size_t count[2] = {1, expect};
+      // Works even if stored as float; netCDF will convert to double.
+      nc_rc(nc_get_vara_double(ncid, varid, start, count, out.data()),
+            std::string("nc_get_vara_double ") + varname);
+    };
+    read_time_axis("ak", ak_);
+    read_time_axis("bk", bk_);
+    nc_rc(nc_close(ncid), "nc_close " + coeffFile);
+    akbk_nlev_model_ = nLevModel;
+  });
+  if (akbk_nlev_model_ != nLevModel) {
+    ABORT("ak/bk cache mismatch: different nLevModel than previously loaded");
+  }
+}
 
-void IOStructuredGrid::read(State & x, const eckit::LocalConfiguration &  ,
-                                const eckit::LocalConfiguration & fileioscaling) const {
-  ABORT("IOStructuredGrid::read(State) not implemented");
+void IOStructuredGrid::read(State & x,
+                            const eckit::LocalConfiguration & fileionames,
+                            const eckit::LocalConfiguration & fileioscaling) const {
+  util::Timer timer(classname(), "read(State vertical remap)");
+
+  using clock_t = std::chrono::steady_clock;
+  auto sec = [](clock_t::time_point a, clock_t::time_point b) {
+    return std::chrono::duration<double>(b - a).count();
+  };
+
+  const auto t_total0 = clock_t::now();
+  const int rank = geom_.getComm().rank();
+
+  auto log0t = [&](const std::string &s, double v) {
+    if (rank == 0) oops::Log::info() << s << v << " s" << std::endl;
+  };
+
+  const std::string inFile = *params_.inputFilename.value();
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+
+  // ============================================================
+  // 0) Read file dims + coords (rank0) and broadcast
+  // ============================================================
+  size_t nLat = 0, nLon = 0, nLevFile = 0;
+  std::vector<double> file_lats, file_lons;
+  int fileNorthToSouth_i = 0;
+
+  auto t_dims0 = clock_t::now();
+  if (rank == 0) {
+    int ncid;
+    nc_rc(nc_open(inFile.c_str(), NC_NOWRITE, &ncid), "nc_open " + inFile);
+
+    int dim_gridyt, dim_gridxt, dim_pfull;
+    nc_rc(nc_inq_dimid(ncid, "grid_yt", &dim_gridyt), "nc_inq_dimid grid_yt");
+    nc_rc(nc_inq_dimlen(ncid, dim_gridyt, &nLat), "nc_inq_dimlen grid_yt");
+    nc_rc(nc_inq_dimid(ncid, "grid_xt", &dim_gridxt), "nc_inq_dimid grid_xt");
+    nc_rc(nc_inq_dimlen(ncid, dim_gridxt, &nLon), "nc_inq_dimlen grid_xt");
+
+    nc_rc(nc_inq_dimid(ncid, "pfull", &dim_pfull), "nc_inq_dimid pfull");
+    nc_rc(nc_inq_dimlen(ncid, dim_pfull, &nLevFile), "nc_inq_dimlen pfull");
+
+    file_lats.resize(nLat);
+    file_lons.resize(nLon);
+
+    int var_gridyt, var_gridxt;
+    nc_rc(nc_inq_varid(ncid, "grid_yt", &var_gridyt), "nc_inq_varid grid_yt");
+    nc_rc(nc_get_var_double(ncid, var_gridyt, file_lats.data()), "nc_get_var grid_yt");
+    nc_rc(nc_inq_varid(ncid, "grid_xt", &var_gridxt), "nc_inq_varid grid_xt");
+    nc_rc(nc_get_var_double(ncid, var_gridxt, file_lons.data()), "nc_get_var grid_xt");
+
+    fileNorthToSouth_i = (nLat >= 2 && file_lats[0] > file_lats[nLat - 1]) ? 1 : 0;
+
+    nc_rc(nc_close(ncid), "nc_close " + inFile);
   }
 
-// -------------------------------------------------------------------------------------------------
+  geom_.getComm().broadcast(nLat, 0);
+  geom_.getComm().broadcast(nLon, 0);
+  geom_.getComm().broadcast(nLevFile, 0);
 
+  if (rank != 0) {
+    file_lats.resize(nLat);
+    file_lons.resize(nLon);
+  }
+  geom_.getComm().broadcast(file_lats.begin(), file_lats.end(), 0);
+  geom_.getComm().broadcast(file_lons.begin(), file_lons.end(), 0);
+  geom_.getComm().broadcast(fileNorthToSouth_i, 0);
+
+  log0t("[TIMER] read dims+coords+bcast: ", sec(t_dims0, clock_t::now()));
+
+  // ============================================================
+  // 1) Optional regional subset (lon/lat bounds) to reduce I/O
+  // ============================================================
+  size_t lat_start = 0, lat_count = nLat, lon_start = 0, lon_count = nLon;
+  const size_t halo = 10;
+
+  int use_regional_subset_i = 0;
+  double lon_min=-180.0, lon_max=180.0, lat_min=-90.0, lat_max=90.0;
+
+  if (params_.lon_min.value() != boost::none) { lon_min = *params_.lon_min.value(); use_regional_subset_i = 1; }
+  if (params_.lon_max.value() != boost::none) { lon_max = *params_.lon_max.value(); use_regional_subset_i = 1; }
+  if (params_.lat_min.value() != boost::none) { lat_min = *params_.lat_min.value(); use_regional_subset_i = 1; }
+  if (params_.lat_max.value() != boost::none) { lat_max = *params_.lat_max.value(); use_regional_subset_i = 1; }
+
+  const bool fileNorthToSouth = (fileNorthToSouth_i != 0);
+  const double lat_lo_user = std::min(lat_min, lat_max);
+  const double lat_hi_user = std::max(lat_min, lat_max);
+  const double lon_lo_user = std::min(lon_min, lon_max);
+  const double lon_hi_user = std::max(lon_min, lon_max);
+
+  auto bound_index = [](const std::vector<double> &a, double v, bool left) -> size_t {
+    const size_t n = a.size();
+    if (n == 0) return 0;
+    if (left) {
+      if (v <= a.front()) return 0;
+      if (v >= a.back())  return n-1;
+      auto it = std::lower_bound(a.begin(), a.end(), v);
+      return static_cast<size_t>(std::distance(a.begin(), it));
+    } else {
+      if (v <= a.front()) return 0;
+      if (v >= a.back())  return n-1;
+      auto it = std::upper_bound(a.begin(), a.end(), v);
+      if (it == a.begin()) return 0;
+      --it;
+      return static_cast<size_t>(std::distance(a.begin(), it));
+    }
+  };
+
+  auto t_subset0 = clock_t::now();
+  if (rank == 0 && use_regional_subset_i == 1) {
+    double search_lon_min = lon_lo_user;
+    double search_lon_max = lon_hi_user;
+
+    if (!file_lons.empty() && file_lons.back() > 180.0) {
+      oops::Log::info() << "User bounds: lon=[" << lon_lo_user << "," << lon_hi_user
+                        << "] lat=[" << lat_lo_user << "," << lat_hi_user << "]" << std::endl;
+      if (search_lon_min < 0.0) search_lon_min += 360.0;
+      if (search_lon_max < 0.0) search_lon_max += 360.0;
+      oops::Log::info() << "Converted to file lon=[0..360): lon=[" << search_lon_min
+                        << "," << search_lon_max << "]" << std::endl;
+      if (search_lon_max < search_lon_min) {
+        ABORT("Dateline crossing subset is not supported by current subset logic");
+      }
+    }
+
+    std::vector<double> lats_asc = file_lats;
+    if (fileNorthToSouth) std::reverse(lats_asc.begin(), lats_asc.end());
+
+    size_t idx_lat_lo = bound_index(lats_asc, lat_lo_user, true);
+    size_t idx_lat_hi = bound_index(lats_asc, lat_hi_user, false);
+    if (idx_lat_lo > idx_lat_hi) std::swap(idx_lat_lo, idx_lat_hi);
+
+    size_t idx_lon_lo = bound_index(file_lons, search_lon_min, true);
+    size_t idx_lon_hi = bound_index(file_lons, search_lon_max, false);
+    if (idx_lon_lo > idx_lon_hi) std::swap(idx_lon_lo, idx_lon_hi);
+
+    idx_lat_lo = (idx_lat_lo > halo) ? (idx_lat_lo - halo) : 0;
+    idx_lat_hi = std::min(idx_lat_hi + halo, nLat - 1);
+    idx_lon_lo = (idx_lon_lo > halo) ? (idx_lon_lo - halo) : 0;
+    idx_lon_hi = std::min(idx_lon_hi + halo, nLon - 1);
+
+    size_t lat_start_file = 0, lat_end_file = 0;
+    if (fileNorthToSouth) {
+      lat_start_file = (nLat - 1) - idx_lat_hi;
+      lat_end_file   = (nLat - 1) - idx_lat_lo;
+    } else {
+      lat_start_file = idx_lat_lo;
+      lat_end_file   = idx_lat_hi;
+    }
+
+    lat_start = lat_start_file;
+    lat_count = lat_end_file - lat_start_file + 1;
+    lon_start = idx_lon_lo;
+    lon_count = idx_lon_hi - idx_lon_lo + 1;
+
+    const size_t lat_end_print = lat_start + lat_count - 1;
+    const size_t lon_end_print = lon_start + lon_count - 1;
+
+    oops::Log::info()
+      << "Regional subset indices: "
+      << "  Latitude:  [" << lat_start << ":" << lat_end_print << "] = "
+      << file_lats[lat_start] << " to " << file_lats[lat_end_print]
+      << "  Longitude: [" << lon_start << ":" << lon_end_print << "] = "
+      << file_lons[lon_start] << " to " << file_lons[lon_end_print]
+      << "  Data reduction: " << lat_count << " x " << lon_count
+      << " (was " << nLat << " x " << nLon << ")" << std::endl;
+  }
+  log0t("[TIMER] subset compute: ", sec(t_subset0, clock_t::now()));
+
+  geom_.getComm().broadcast(use_regional_subset_i, 0);
+  const bool use_regional_subset = (use_regional_subset_i != 0);
+  geom_.getComm().broadcast(lat_start, 0);
+  geom_.getComm().broadcast(lat_count, 0);
+  geom_.getComm().broadcast(lon_start, 0);
+  geom_.getComm().broadcast(lon_count, 0);
+
+  const size_t lat_end = lat_start + lat_count - 1;
+  const size_t lon_end = lon_start + lon_count - 1;
+
+  // ============================================================
+  // 2) Pull State FieldSet and get model levels
+  // ============================================================
+  atlas::FieldSet fieldsModelAll;
+  x.toFieldSet(fieldsModelAll);
+
+  if (!fieldsModelAll.has("air_temperature")) {
+    ABORT("State missing air_temperature (needed to infer nLevModel)");
+  }
+  atlas::Field & tField = fieldsModelAll.field("air_temperature");
+  const int nLevModel = (tField.rank() >= 2) ? static_cast<int>(tField.shape(1)) : 1;
+
+  if (rank == 0) {
+    oops::Log::info() << "[CHECK-NLEV] file pfull=" << nLevFile
+                      << " model levels=" << nLevModel << std::endl;
+  }
+  if (nLevModel <= 1) ABORT("Model State appears not to have 3D levels (nLevModel<=1)");
+
+  // ============================================================
+  // 3) Load ak/bk once (target model coordinate)
+  // ============================================================
+  loadAkBkOnce_(nLevModel);
+
+  // ============================================================
+  // 4) Variable mapping
+  // ============================================================
+  struct Var3D { std::string stateName; std::string fileName; };
+  std::vector<Var3D> vars3d;
+
+  const auto & stateVars = x.variables();
+
+  std::map<std::string, std::string> ioNameMap;
+  if (fileionames.has("field io names")) {
+    eckit::LocalConfiguration ionames = fileionames.getSubConfiguration("field io names");
+    std::vector<std::string> keys = ionames.keys();
+    for (const auto & key : keys) {
+      ioNameMap[key] = ionames.getString(key);
+    }
+  } else {
+    std::vector<std::string> keys = fileionames.keys();
+    for (const auto & key : keys) {
+      try {
+        ioNameMap[key] = fileionames.getString(key);
+      } catch (...) {
+      }
+    }
+  }
+
+  const std::vector<std::string> skip2D = {"air_pressure_at_surface", "surface_pressure",
+                                      "geopotential_height_at_surface"};
+  for (size_t i = 0; i < stateVars.size(); ++i) {
+    std::string varName = stateVars[i].name();
+    if (std::find(skip2D.begin(), skip2D.end(), varName) != skip2D.end()) continue;
+    std::string fileName = varName;
+    if (ioNameMap.count(varName) > 0) fileName = ioNameMap[varName];
+    vars3d.push_back({varName, fileName});
+  }
+
+  if (rank == 0) {
+    oops::Log::info() << "[I/O] Reading " << vars3d.size() << " 3D variables:" << std::endl;
+    for (const auto & v : vars3d) {
+      oops::Log::info() << "  " << v.stateName << " <- " << v.fileName << std::endl;
+    }
+  }
+
+  for (const auto & v : vars3d) {
+    if (!fieldsModelAll.has(v.stateName)) {
+      if (rank == 0) oops::Log::error() << "State missing required field: " << v.stateName << std::endl;
+      ABORT("State missing required 3D field");
+    }
+  }
+  if (!fieldsModelAll.has("air_pressure_at_surface")) {
+    ABORT("State missing air_pressure_at_surface");
+  }
+
+  const std::string dpresName = "__dpres__";
+  const std::string psName    = "__pressfc__";
+
+  // VertRemap path for terrain/orography-aware adjustment.
+  // If the required source or target orography fields are unavailable,
+  // fall back to the existing pressure-space
+  // log-p remap rather than aborting. No local simplified hydrostatic or
+  // lapse-rate approximation is added here.
+  const std::string orogName = "geopotential_height_at_surface";
+  std::string sourceOrogFileName = "hgtsfc";
+  if (ioNameMap.count(orogName) > 0) sourceOrogFileName = ioNameMap[orogName];
+
+  bool hasSourceOrogFile = false;
+  {
+    int ncid_check;
+    nc_rc(nc_open(inFile.c_str(), NC_NOWRITE, &ncid_check),
+          "nc_open for source orography check " + inFile);
+    int varid_check;
+    hasSourceOrogFile = (nc_inq_varid(ncid_check, sourceOrogFileName.c_str(), &varid_check) == NC_NOERR);
+    nc_rc(nc_close(ncid_check), "nc_close source orography check");
+  }
+
+  // Target/model orography for VertRemap.
+  // Do NOT read geopotential_height_at_surface from FMS restart files here.
+  // In read mode, prefer the model Geometry FieldSet, but also allow a
+  // fallback to the State FieldSet if the field has already been materialized
+  // there (for example by Vader or an earlier variable change path).
+  // It is not requested through sfc_data.
+  //
+  // This avoids the incorrect lookup:
+  //   sfc_data.* variable: geopotential_height_at_surface
+  // which can abort before fallback is reached.
+  atlas::FieldSet fieldsOrog;
+  bool hasTargetOrogField = false;
+  std::string targetOrogSource = "";
+
+  if (geom_.fields().has(orogName)) {
+    atlas::Field zsOrogTarget = geom_.fields().field(orogName).clone();
+    zsOrogTarget.rename(orogName);
+    fieldsOrog.add(zsOrogTarget);
+    hasTargetOrogField = true;
+    targetOrogSource = "Geometry fields";
+  } else if (fieldsModelAll.has(orogName)) {
+    atlas::Field zsOrogTarget = fieldsModelAll.field(orogName).clone();
+    zsOrogTarget.rename(orogName);
+    fieldsOrog.add(zsOrogTarget);
+    hasTargetOrogField = true;
+    targetOrogSource = "State FieldSet";
+  }
+
+  const bool doVertRemap = hasTargetOrogField && hasSourceOrogFile;
+  if (rank == 0) {
+    if (doVertRemap) {
+      oops::Log::info() << "[VERT-REMAP] VertRemap enabled by default in read mode using source "
+                        << sourceOrogFileName << " and target " << orogName
+                        << " from " << targetOrogSource << std::endl;
+    } else {
+      oops::Log::info() << "[VERT-REMAP] VertRemap fallback in read mode: ";
+      if (!hasTargetOrogField) {
+        oops::Log::info() << "target field '" << orogName
+                          << "' is missing from Geometry fields and State FieldSet; ";
+      }
+      if (!hasSourceOrogFile) {
+        oops::Log::info() << "source field '" << sourceOrogFileName << "' is missing from "
+                          << inFile << "; ";
+      }
+      oops::Log::info() << "using pressure-space log-p remap only." << std::endl;
+    }
+  }
+
+  // ============================================================
+  // 5) Create source fields on structured FS and temporary model-grid
+  //    fields still at FILE vertical levels. Vertical remap will be
+  //    done AFTER horizontal interpolation.
+  // ============================================================
+  atlas::FieldSet srcFS;
+  atlas::FieldSet tgtModelFileLevels;
+
+  auto make_model_tmp = [&](const std::string & name, int levels) -> atlas::Field {
+    return geom_.functionSpace().createField<double>(
+      atlas::option::name(name) | atlas::option::levels(levels));
+  };
+
+  for (const auto & v : vars3d) {
+    srcFS.add(readFunctionSpace_->createField<double>(
+      atlas::option::name(v.stateName) | atlas::option::levels(static_cast<int>(nLevFile))));
+    tgtModelFileLevels.add(make_model_tmp(v.stateName, static_cast<int>(nLevFile)));
+  }
+
+  srcFS.add(readFunctionSpace_->createField<double>(
+    atlas::option::name(dpresName) | atlas::option::levels(static_cast<int>(nLevFile))));
+  tgtModelFileLevels.add(make_model_tmp(dpresName, static_cast<int>(nLevFile)));
+
+  srcFS.add(readFunctionSpace_->createField<double>(
+    atlas::option::name(psName) | atlas::option::levels(1)));
+  tgtModelFileLevels.add(make_model_tmp(psName, 1));
+
+  if (doVertRemap) {
+    srcFS.add(readFunctionSpace_->createField<double>(
+      atlas::option::name(orogName) | atlas::option::levels(1)));
+    tgtModelFileLevels.add(make_model_tmp(orogName, 1));
+  }
+
+  auto set_interp_type = [&](atlas::FieldSet & fs, const std::string & val) {
+    for (auto & f : fs) {
+      if (!f.metadata().has("interp_type")) f.metadata().set("interp_type", val);
+    }
+  };
+  set_interp_type(srcFS, "default");
+  set_interp_type(tgtModelFileLevels, "default");
+
+  // ============================================================
+  // 6) Read slabs (level-parallel I/O) into structured srcFS
+  // ============================================================
+  const auto gidxView  = atlas::array::make_view<atlas::gidx_t,1>(readFunctionSpace_->global_index());
+  const auto ghostView = atlas::array::make_view<int,1>(readFunctionSpace_->ghost());
+
+  const int n_ranks = geom_.getComm().size();
+
+  struct VarInfo {
+    std::string fileName;
+    std::string stateName;
+    int nLevels;
+    bool is3D;
+  };
+
+  std::vector<VarInfo> all_vars;
+  for (const auto & v : vars3d) {
+    all_vars.push_back({v.fileName, v.stateName, static_cast<int>(nLevFile), true});
+  }
+  all_vars.push_back({"dpres", dpresName, static_cast<int>(nLevFile), true});
+  all_vars.push_back({"pressfc", psName, 1, false});
+  if (doVertRemap) {
+    all_vars.push_back({sourceOrogFileName, orogName, 1, false});
+  }
+
+  struct SliceWork {
+    int var_idx;
+    int level_idx;
+  };
+
+  std::vector<SliceWork> all_slices;
+  for (int v = 0; v < static_cast<int>(all_vars.size()); ++v) {
+    for (int lev = 0; lev < all_vars[v].nLevels; ++lev) {
+      all_slices.push_back({v, lev});
+    }
+  }
+
+  const int total_slices = static_cast<int>(all_slices.size());
+  const int slices_per_rank = (total_slices + n_ranks - 1) / n_ranks;
+
+  if (rank == 0) {
+    oops::Log::info() << "[I/O LEVEL-PARALLEL] " << total_slices
+                      << " 2D slices distributed across " << n_ranks << " ranks ("
+                      << slices_per_rank << " slices/rank avg)" << std::endl;
+  }
+
+  int ncid;
+  nc_rc(nc_open(inFile.c_str(), NC_NOWRITE, &ncid), "nc_open " + inFile);
+
+  auto t_read_start = clock_t::now();
+  std::map<int, std::map<int, std::vector<float>>> my_slices;
+  const size_t plane_size = lat_count * lon_count;
+
+  int my_slice_count = 0;
+  for (int s = rank; s < total_slices; s += n_ranks) {
+    const auto & work = all_slices[s];
+    const int v_idx = work.var_idx;
+    const int lev_idx = work.level_idx;
+    const auto & var = all_vars[v_idx];
+
+    std::vector<float> slice_data(plane_size);
+    int varid;
+    nc_rc(nc_inq_varid(ncid, var.fileName.c_str(), &varid), "nc_inq_varid " + var.fileName);
+
+    if (var.is3D) {
+      size_t start[4] = {0, static_cast<size_t>(lev_idx), lat_start, lon_start};
+      size_t count[4] = {1, 1, lat_count, lon_count};
+      nc_rc(nc_get_vara_float(ncid, varid, start, count, slice_data.data()),
+            "nc_get_vara_float " + var.fileName);
+    } else {
+      size_t start[3] = {0, lat_start, lon_start};
+      size_t count[3] = {1, lat_count, lon_count};
+      nc_rc(nc_get_vara_float(ncid, varid, start, count, slice_data.data()),
+            "nc_get_vara_float " + var.fileName);
+    }
+
+    my_slices[v_idx][lev_idx] = std::move(slice_data);
+    my_slice_count++;
+  }
+
+  nc_rc(nc_close(ncid), "nc_close");
+  double t_read_local = sec(t_read_start, clock_t::now());
+
+  if (rank == 0 || rank == n_ranks - 1) {
+    oops::Log::info() << "[I/O rank " << rank << "] read " << my_slice_count
+                      << " slices in " << t_read_local << "s" << std::endl;
+  }
+
+  auto t_gather_start = clock_t::now();
+  for (int v = 0; v < static_cast<int>(all_vars.size()); ++v) {
+    const auto & var = all_vars[v];
+    std::vector<float> full_var(plane_size * var.nLevels);
+
+    int var_slice_offset = 0;
+    for (int vv = 0; vv < v; ++vv) var_slice_offset += all_vars[vv].nLevels;
+
+    for (int lev = 0; lev < var.nLevels; ++lev) {
+      const int slice_global_idx = var_slice_offset + lev;
+      const int owner_rank = slice_global_idx % n_ranks;
+      std::vector<float> level_data(plane_size);
+      if (rank == owner_rank) level_data = my_slices[v][lev];
+      geom_.getComm().broadcast(level_data.begin(), level_data.end(), owner_rank);
+      std::copy(level_data.begin(), level_data.end(), full_var.begin() + lev * plane_size);
+    }
+
+    atlas::Field & field = srcFS.field(var.stateName);
+    auto v_view = atlas::array::make_view<double, 2>(field);
+    const int nLev = var.nLevels;
+
+    for (atlas::idx_t p = 0; p < v_view.shape(0); ++p) {
+      for (int k = 0; k < nLev; ++k) v_view(p, k) = nan;
+    }
+
+    for (atlas::idx_t p = 0; p < v_view.shape(0); ++p) {
+      if (ghostView(p) != 0) continue;
+      const auto gidx = gidxView(p);
+      if (gidx <= 0) continue;
+
+      const std::size_t g = static_cast<std::size_t>(gidx) - 1;
+      const std::size_t i = g % nLon;
+      const std::size_t j = g / nLon;
+      if (i >= nLon || j >= nLat) continue;
+
+      if (use_regional_subset) {
+        if (i < lon_start || i > lon_end || j < lat_start || j > lat_end) continue;
+      }
+
+      const std::size_t ii = i - lon_start;
+      const std::size_t jj = j - lat_start;
+      for (int k = 0; k < nLev; ++k) {
+        const size_t idx = (static_cast<size_t>(k) * lat_count + jj) * lon_count + ii;
+        v_view(p, k) = static_cast<double>(full_var[idx]);
+      }
+    }
+
+    readFunctionSpace_->haloExchange(field);
+  }
+
+  double t_gather = sec(t_gather_start, clock_t::now());
+  double t_read_max = t_read_local;
+  geom_.getComm().allReduceInPlace(t_read_max, eckit::mpi::Operation::MAX);
+  log0t("[TIMER LEVEL-PARALLEL] NetCDF read (parallel across levels, max): ", t_read_max);
+  log0t("[TIMER LEVEL-PARALLEL] Gather and assemble (broadcasts): ", t_gather);
+
+  // ============================================================
+  // 7) Horizontal interpolation first: file grid -> model grid,
+  //    still preserving FILE vertical levels.
+  // ============================================================
+  auto t_h0 = clock_t::now();
+
+  for (auto & f : tgtModelFileLevels) {
+    auto v = atlas::array::make_view<double, 2>(f);
+    for (atlas::idx_t p = 0; p < v.shape(0); ++p) {
+      for (int k = 0; k < v.shape(1); ++k) v(p, k) = nan;
+    }
+  }
+
+  interpolatorBack_->apply(srcFS, tgtModelFileLevels);
+  log0t("[TIMER] horizontal interp (file->model @file-levels): ", sec(t_h0, clock_t::now()));
+
+  // ============================================================
+  // 8) Vertical remap on MODEL grid: file levels -> model levels
+  // ============================================================
+  auto t_v0 = clock_t::now();
+
+  atlas::FieldSet tgtModelRemapped;
+  for (const auto & v : vars3d) {
+    tgtModelRemapped.add(make_model_tmp(v.stateName, nLevModel));
+  }
+  set_interp_type(tgtModelRemapped, "default");
+
+  auto dpresV_model_fileLev = atlas::array::make_view<double, 2>(tgtModelFileLevels.field(dpresName));
+  auto psV_model            = atlas::array::make_view<double, 2>(tgtModelFileLevels.field(psName));
+  auto psState              = atlas::array::make_view<double, 2>(fieldsModelAll.field("air_pressure_at_surface"));
+
+  auto interp_logp = [&](const std::vector<double> & p_src,
+                         const std::vector<double> & x_src,
+                         double p_tgt) -> double {
+    const size_t n = p_src.size();
+    if (n < 2) return x_src.empty() ? nan : x_src.front();
+    if (p_tgt <= p_src.front()) return x_src.front();
+    if (p_tgt >= p_src.back())  return x_src.back();
+
+    auto it = std::upper_bound(p_src.begin(), p_src.end(), p_tgt);
+    size_t k1 = std::max<size_t>(1, static_cast<size_t>(it - p_src.begin())) - 1;
+    size_t k2 = k1 + 1;
+
+    const double p1 = std::max(1.0, p_src[k1]);
+    const double p2 = std::max(1.0, p_src[k2]);
+    const double x1 = x_src[k1];
+    const double x2 = x_src[k2];
+    const double denom = std::log(p2) - std::log(p1);
+    if (std::abs(denom) < 1.0e-12) return x1;
+
+    const double w = (std::log(std::max(1.0, p_tgt)) - std::log(p1)) / denom;
+    return x1 + w * (x2 - x1);
+  };
+
+  std::vector<double> p_int_src(nLevFile + 1);
+  std::vector<double> p_mid_src(nLevFile);
+  std::vector<double> p_int_tgt(nLevModel + 1);
+  std::vector<double> p_mid_tgt(nLevModel);
+  std::vector<double> x_src(nLevFile);
+
+  const atlas::idx_t npts_model = psV_model.shape(0);
+  for (const auto & vinfo : vars3d) {
+    auto srcVar_fileLev = atlas::array::make_view<double, 2>(tgtModelFileLevels.field(vinfo.stateName));
+    auto dstVar_modLev  = atlas::array::make_view<double, 2>(tgtModelRemapped.field(vinfo.stateName));
+
+    for (atlas::idx_t p = 0; p < npts_model; ++p) {
+      p_int_src[0] = 0.0;
+      for (size_t k = 0; k < nLevFile; ++k) {
+        double dp = dpresV_model_fileLev(p, static_cast<int>(k));
+        if (!std::isfinite(dp) || dp < 0.0) dp = 0.0;
+        p_int_src[k + 1] = p_int_src[k] + dp;
+      }
+
+      double ps_col = psV_model(p, 0);
+      if ((!std::isfinite(ps_col) || ps_col <= 0.0) && p_int_src[nLevFile] > 0.0) {
+        ps_col = p_int_src[nLevFile];
+      }
+      if ((!std::isfinite(ps_col) || ps_col <= 0.0) && std::isfinite(psState(p, 0)) && psState(p, 0) > 0.0) {
+        ps_col = psState(p, 0);
+      }
+
+      const double sumdp = p_int_src[nLevFile];
+      const double scale = (sumdp > 0.0 && ps_col > 0.0) ? (ps_col / sumdp) : 1.0;
+      for (size_t k = 0; k <= nLevFile; ++k) p_int_src[k] *= scale;
+
+      for (size_t k = 0; k < nLevFile; ++k) {
+        p_mid_src[k] = 0.5 * (p_int_src[k] + p_int_src[k + 1]);
+        if (p_mid_src[k] < 1.0) p_mid_src[k] = 1.0;
+        x_src[k] = srcVar_fileLev(p, static_cast<int>(k));
+      }
+
+      for (int k = 0; k <= nLevModel; ++k) {
+        p_int_tgt[k] = ak_[k] + bk_[k] * ps_col;
+        if (p_int_tgt[k] < 1.0) p_int_tgt[k] = 1.0;
+      }
+      for (int k = 0; k < nLevModel; ++k) {
+        p_mid_tgt[k] = 0.5 * (p_int_tgt[k] + p_int_tgt[k + 1]);
+        if (p_mid_tgt[k] < 1.0) p_mid_tgt[k] = 1.0;
+      }
+
+      for (int k = 0; k < nLevModel; ++k) {
+        dstVar_modLev(p, k) = interp_logp(p_mid_src, x_src, p_mid_tgt[k]);
+      }
+    }
+  }
+
+  if (doVertRemap) {
+    // Match the write-side usage pattern:
+    //   - tgtModelRemapped carries the horizontally interpolated source surface height
+    //     as geopotential_height_at_surface.
+    //   - fieldsOrog carries the real target-grid/model surface height.
+    //   - VertRemap performs its own terrain-aware surface-pressure adjustment and
+    //     vertical remapping. No local simplified hydrostatic formula is used here.
+    if (!tgtModelRemapped.has(orogName)) {
+      atlas::Field zsSourceInterp = tgtModelFileLevels.field(orogName).clone();
+      zsSourceInterp.rename(orogName);
+      tgtModelRemapped.add(zsSourceInterp);
+    }
+    if (!tgtModelRemapped.has("air_pressure_at_surface")) {
+      atlas::Field psSourceInterp = make_model_tmp("air_pressure_at_surface", 1);
+      auto psSrc = atlas::array::make_view<double, 2>(tgtModelFileLevels.field(psName));
+      auto psDst = atlas::array::make_view<double, 2>(psSourceInterp);
+      for (atlas::idx_t p = 0; p < psDst.shape(0); ++p) {
+        psDst(p, 0) = psSrc(p, 0);
+      }
+      tgtModelRemapped.add(psSourceInterp);
+    }
+
+    fv3jedi::VertRemap vert_remap(geom_, fieldsOrog);
+    tgtModelRemapped = vert_remap.remap(tgtModelRemapped);
+  }
+
+  log0t("[TIMER] vertical remap (model-grid, file-levels->model-levels): ", sec(t_v0, clock_t::now()));
+
+  // ============================================================
+  // 9) Copy remapped fields into State and update surface pressure
+  // ============================================================
+  for (const auto & vinfo : vars3d) {
+    auto src = atlas::array::make_view<double, 2>(tgtModelRemapped.field(vinfo.stateName));
+    auto dst = atlas::array::make_view<double, 2>(fieldsModelAll.field(vinfo.stateName));
+    for (atlas::idx_t p = 0; p < dst.shape(0); ++p) {
+      for (int k = 0; k < nLevModel; ++k) dst(p, k) = src(p, k);
+    }
+  }
+
+  if (tgtModelRemapped.has("air_pressure_at_surface")) {
+    auto psRemapped = atlas::array::make_view<double, 2>(
+      tgtModelRemapped.field("air_pressure_at_surface"));
+    for (atlas::idx_t p = 0; p < psState.shape(0); ++p) {
+      const double v = psRemapped(p, 0);
+      if (std::isfinite(v) && v > 0.0) psState(p, 0) = v;
+    }
+  } else {
+    for (atlas::idx_t p = 0; p < psState.shape(0); ++p) {
+      const double v = psV_model(p, 0);
+      if (std::isfinite(v) && v > 0.0) psState(p, 0) = v;
+    }
+  }
+
+  // ============================================================
+  // 10) Copy back to State
+  // ============================================================
+  auto t_from0 = clock_t::now();
+  x.fromFieldSet(fieldsModelAll);
+  log0t("[TIMER] fromFieldSet: ", sec(t_from0, clock_t::now()));
+
+  // ============================================================
+  // 11) If mode=="both", write interpolated state as fms restart
+  // ============================================================
+  const std::string mode = (params_.mode.value() != boost::none) ? *params_.mode.value() : "read";
+  if (mode == "both") {
+    if (params_.output_datapath.value() == boost::none) {
+      ABORT("IOStructuredGrid: mode is 'both' but no output datapath specified");
+    }
+    if (params_.output_filename_core.value() == boost::none ||
+        params_.output_filename_trcr.value() == boost::none ||
+        params_.output_filename_sfcd.value() == boost::none ||
+        params_.output_filename_sfcw.value() == boost::none ||
+        params_.output_filename_cplr.value() == boost::none) {
+      ABORT("IOStructuredGrid: mode is 'both' but one or more output restart filenames are missing");
+    }
+    auto t_write0 = clock_t::now();
+    eckit::LocalConfiguration outputConfig;
+    outputConfig.set("filetype", "fms restart");
+    outputConfig.set("datapath", *params_.output_datapath.value());
+    outputConfig.set("filename_core", *params_.output_filename_core.value());
+    outputConfig.set("filename_trcr", *params_.output_filename_trcr.value());
+    outputConfig.set("filename_sfcd", *params_.output_filename_sfcd.value());
+    outputConfig.set("filename_sfcw", *params_.output_filename_sfcw.value());
+    outputConfig.set("filename_cplr", *params_.output_filename_cplr.value());
+    if (params_.output_field_io_names.value() != boost::none) {
+      outputConfig.set("field io names", *params_.output_field_io_names.value());
+    }
+    x.write(outputConfig);
+    log0t("[TIMER] write fms restart: ", sec(t_write0, clock_t::now()));
+  }
+
+  log0t("[TIMER] TOTAL read(): ", sec(t_total0, clock_t::now()));
+}
+// -------------------------------------------------------------------------------------------------
 void IOStructuredGrid::read(Increment & dx, const eckit::LocalConfiguration & fileionames,
                                 const eckit::LocalConfiguration & fileioscaling) const {
   ABORT("IOStructuredGrid::read(Increment) not implemented");
@@ -161,6 +1058,7 @@ void IOStructuredGrid::interpAndWrite(const T & obj, const std::string & label,
   }
 
   oops::Log::trace() << classname() << " write " << label << " done" << std::endl;
+//  geom_.getComm().broadcast(fieldsStructured, 0);
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -175,16 +1073,6 @@ void IOStructuredGrid::write(const State & x, const eckit::LocalConfiguration & 
 void IOStructuredGrid::write(const Increment & dx, const eckit::LocalConfiguration & fileionames,
                              const eckit::LocalConfiguration & fileioscaling) const {
   this->interpAndWrite(dx, "increment", fileionames, fileioscaling);
-}
-
-// -------------------------------------------------------------------------------------------------
-
-static inline void nc_rc(const int return_code, const std::string & operation) {
-  // If there was a failure of the netCDF operation, abort with the error message
-  if (return_code) {
-    ABORT("IOStructuredGrid netCDF operation \'" + operation + "\' failed with error: "
-          + nc_strerror(return_code));
-  }
 }
 
 // -------------------------------------------------------------------------------------------------
