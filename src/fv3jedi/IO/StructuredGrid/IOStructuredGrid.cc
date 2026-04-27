@@ -46,7 +46,7 @@ static IOMaker<IOStructuredGrid> makerIOStructuredGrid_("structured grid");
 static IOMaker<IOStructuredGrid> makerIOAuxGrid_("auxgrid");
 // -------------------------------------------------------------------------------------------------
 static inline void nc_rc(const int return_code, const std::string & operation) {
-  if (return_code) {
+  if (return_code != NC_NOERR) {
     ABORT("IOStructuredGrid netCDF operation \'" + operation + "\' failed with error: "
           + nc_strerror(return_code));
   }
