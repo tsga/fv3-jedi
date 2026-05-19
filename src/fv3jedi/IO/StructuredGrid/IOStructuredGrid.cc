@@ -10,11 +10,16 @@
 #include <map>
 #include <vector>
 #include <chrono>
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <sstream>
+#include <string>
 
+#include "atlas/array.h"
+#include "atlas/field.h"
 #include "atlas/functionspace.h"
 #include "atlas/grid.h"
-#include "atlas/grid/StructuredGrid.h"
-#include "atlas/grid/Spacing.h"
 
 #include "oops/base/GeometryData.h"
 #include "oops/util/FieldSetHelpers.h"
@@ -29,17 +34,6 @@
 #include "fv3jedi/State/State.h"
 #include "fv3jedi/Utilities/fv3jedi_vertical_remap.h"
 
-#include <cmath>
-#include <string>
-#include <algorithm>
-#include <sys/stat.h>
-#include "atlas/array.h"
-#include "atlas/field.h"
-
-#include <sstream>
-#include <unistd.h>  // getpid()
-#include <limits>
-
 namespace fv3jedi {
 // -------------------------------------------------------------------------------------------------
 static IOMaker<IOStructuredGrid> makerIOStructuredGrid_("structured grid");
@@ -52,6 +46,14 @@ static inline void nc_rc(const int return_code, const std::string & operation) {
   }
 }
 
+static inline bool validMode(const std::string & mode) {
+  return mode == "read" || mode == "write" || mode == "both";
+}
+
+static inline std::string validModeMessage(const std::string & mode) {
+  return "IOStructuredGrid: invalid mode '" + mode
+       + "'. Expected one of: 'read', 'write', or 'both'.";
+}
 
 // -------------------------------------------------------------------------------------------------
 IOStructuredGrid::IOStructuredGrid(const Geometry & geom, const Parameters_ & params)
@@ -61,6 +63,9 @@ IOStructuredGrid::IOStructuredGrid(const Geometry & geom, const Parameters_ & pa
   oops::Log::trace() << classname() << " constructor starting" << std::endl;
 
   const std::string mode = (params_.mode.value() != boost::none) ? *params_.mode.value() : "write";
+  if (!validMode(mode)) {
+    ABORT(validModeMessage(mode));
+  }
 
   // Create the Atlas structured grid
   // --------------------------------
@@ -127,14 +132,15 @@ IOStructuredGrid::IOStructuredGrid(const Geometry & geom, const Parameters_ & pa
   // READ mode: build INPUT geometry from file
   // -------------------------
   if (params_.inputFilename.value() == boost::none) {
-    ABORT("IOStructuredGrid: mode is 'read' but no input filename specified");
+    ABORT("IOStructuredGrid: mode is '" + mode
+          + "' but no input filename was specified. The 'input filename' option is required "
+          + "for read and both modes.");
   }
   const std::string inFile = *params_.inputFilename.value();
 
   size_t nLat = 0, nLon = 0;
   std::vector<double> file_lats;
   std::vector<double> file_lons;
-
   if (geom_.getComm().rank() == 0) {
     int ncid;
     nc_rc(nc_open(inFile.c_str(), NC_NOWRITE, &ncid), "nc_open " + inFile);
@@ -170,7 +176,11 @@ IOStructuredGrid::IOStructuredGrid(const Geometry & geom, const Parameters_ & pa
   geom_.getComm().broadcast(file_lats, 0);
   geom_.getComm().broadcast(file_lons, 0);
 
-  // Use L-grid ONLY for indexing/distribution (NOT for geometry)
+  // Use an Atlas L-grid only as the structured indexing/distribution container.
+  // In HAFS regional applications, the input is treated as a file-defined
+  // structured grid using explicit grid_xt/grid_yt coordinates. The exact source
+  // coordinates are supplied below through the lonlat field. Native F-grid support
+  // can be added later if needed.
   const std::string inputGridType = "L" + std::to_string(nLon) + "x" + std::to_string(nLat);
   const atlas::Grid inputGrid(inputGridType);
 
@@ -200,7 +210,10 @@ IOStructuredGrid::IOStructuredGrid(const Geometry & geom, const Parameters_ & pa
     lonlatView(p,1) = nan;
   }
 
-  // owned fill
+  // grid_yt is stored in the same row order as the NetCDF variables.
+  // Therefore, the structured row index j is mapped directly to file_lats[j].
+  // Do not flip north-to-south files here. Latitude orientation is handled
+  // only when computing optional regional subset indices.
   for (atlas::idx_t p = 0; p < lonlatView.shape(0); ++p) {
     if (ghostView(p) != 0) continue;              // owned only
     const auto gidx = gidxView(p);
@@ -209,7 +222,7 @@ IOStructuredGrid::IOStructuredGrid(const Geometry & geom, const Parameters_ & pa
     const std::size_t i = g % nLon;
     const std::size_t j = g / nLon;
     lonlatView(p,0) = file_lons[i];
-    lonlatView(p,1) = file_lats[j];               // flipLat already autodetected earlier in your version
+    lonlatView(p,1) = file_lats[j];
   }
 
   // populate ghost lonlat consistently
@@ -228,16 +241,16 @@ IOStructuredGrid::IOStructuredGrid(const Geometry & geom, const Parameters_ & pa
     interpConfig.set("local interpolator type", "oops unstructured grid interpolator");
   }
 
-// Only create interpolator once
-if (!interpolatorBack_) {
-  interpolatorBack_.reset(new oops::GlobalInterpolator(interpConfig,
-                                                       structuredGeomData,
-                                                       geom.functionSpace(),
-                                                       geom.getComm()));
-  if (geom_.getComm().rank() == 0) {
-    oops::Log::info() << "Interpolator created (will be reused for all files)" << std::endl;
+  // Only create interpolator once
+  if (!interpolatorBack_) {
+    interpolatorBack_.reset(new oops::GlobalInterpolator(interpConfig,
+                                                         structuredGeomData,
+                                                         geom.functionSpace(),
+                                                         geom.getComm()));
+    if (geom_.getComm().rank() == 0) {
+      oops::Log::info() << "Interpolator created (will be reused for all files)" << std::endl;
+    }
   }
-}
 
   oops::Log::trace() << classname() << " constructor done (" << mode << ")" << std::endl;
 }
@@ -252,7 +265,9 @@ IOStructuredGrid::~IOStructuredGrid() {
 void IOStructuredGrid::loadAkBkOnce_(int nLevModel) const {
   std::call_once(akbk_once_, [&]() {
     const int rank = geom_.getComm().rank();
-    eckit::LocalConfiguration cfg = params_.toConfiguration();
+    if (params_.akbk.value() == boost::none) {
+      ABORT("IOStructuredGrid: 'akbk' must be specified for read/both mode vertical remapping");
+    }
     const std::string coeffFile = *params_.akbk.value();
     const size_t expect = static_cast<size_t>(nLevModel + 1);
     int ncid;
@@ -312,6 +327,15 @@ void IOStructuredGrid::read(State & x,
   auto log0t = [&](const std::string &s, double v) {
     if (rank == 0) oops::Log::info() << s << v << " s" << std::endl;
   };
+
+  const std::string mode = (params_.mode.value() != boost::none) ? *params_.mode.value() : "write";
+  if (mode == "write") {
+    ABORT("IOStructuredGrid::read(State) called with mode='write'. Use mode='read' or mode='both'.");
+  }
+  if (params_.inputFilename.value() == boost::none) {
+    ABORT("IOStructuredGrid::read(State): no input filename was specified. The 'input filename' "
+          "option is required for read and both modes.");
+  }
 
   const std::string inFile = *params_.inputFilename.value();
   const double nan = std::numeric_limits<double>::quiet_NaN();
@@ -783,6 +807,9 @@ void IOStructuredGrid::read(State & x,
       const std::size_t j = g / nLon;
       if (i >= nLon || j >= nLat) continue;
 
+      // The global index row j is used as the raw file row. This must remain
+      // consistent with the lonlat assignment above: row j uses file_lats[j]
+      // and data row j.
       if (use_regional_subset) {
         if (i < lon_start || i > lon_end || j < lat_start || j > lat_end) continue;
       }
@@ -923,6 +950,10 @@ void IOStructuredGrid::read(State & x,
       tgtModelRemapped.add(zsSourceInterp);
     }
     if (!tgtModelRemapped.has("air_pressure_at_surface")) {
+      // This is the horizontally interpolated source surface pressure. It is
+      // intentionally added to the FieldSet passed to VertRemap. VertRemap may
+      // replace it with terrain-adjusted surface pressure, and that adjusted
+      // value is propagated back to the State below.
       atlas::Field psSourceInterp = make_model_tmp("air_pressure_at_surface", 1);
       auto psSrc = atlas::array::make_view<double, 2>(tgtModelFileLevels.field(psName));
       auto psDst = atlas::array::make_view<double, 2>(psSourceInterp);
@@ -950,6 +981,9 @@ void IOStructuredGrid::read(State & x,
   }
 
   if (tgtModelRemapped.has("air_pressure_at_surface")) {
+    // In the VertRemap path this is the terrain-adjusted surface pressure
+    // returned by VertRemap. In the fallback path this field is absent, so the
+    // State receives the horizontally interpolated source surface pressure below.
     auto psRemapped = atlas::array::make_view<double, 2>(
       tgtModelRemapped.field("air_pressure_at_surface"));
     for (atlas::idx_t p = 0; p < psState.shape(0); ++p) {
@@ -973,7 +1007,6 @@ void IOStructuredGrid::read(State & x,
   // ============================================================
   // 11) If mode=="both", write interpolated state as fms restart
   // ============================================================
-  const std::string mode = (params_.mode.value() != boost::none) ? *params_.mode.value() : "read";
   if (mode == "both") {
     if (params_.output_datapath.value() == boost::none) {
       ABORT("IOStructuredGrid: mode is 'both' but no output datapath specified");
@@ -1058,7 +1091,6 @@ void IOStructuredGrid::interpAndWrite(const T & obj, const std::string & label,
   }
 
   oops::Log::trace() << classname() << " write " << label << " done" << std::endl;
-//  geom_.getComm().broadcast(fieldsStructured, 0);
 }
 
 // -------------------------------------------------------------------------------------------------

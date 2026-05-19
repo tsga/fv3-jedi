@@ -47,8 +47,9 @@ class IOStructuredGridParameters : public IOParametersBase {
                                                      this};
 
   // Filename of input (for reading external structured-grid files)
-  oops::OptionalParameter<std::string> akbk{"akbk", "akbk for interpolation target",
-                                                     this};
+  oops::OptionalParameter<std::string> akbk{"akbk",
+                                            "Filename containing target hybrid coefficients ak/bk",
+                                            this};
 
   // Output fms restart parameters (for mode="both")
   oops::OptionalParameter<std::string> output_datapath{"output datapath",
