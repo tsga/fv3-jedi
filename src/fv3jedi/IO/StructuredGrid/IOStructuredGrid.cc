@@ -1377,10 +1377,10 @@ void IOStructuredGrid::readStructuredFields(const std::string pathFile,
   // Get file number of dimensions + their IDs
   // -----------------------------------------
   int ndims;
-  nc_inq_ndims(fileId, &ndims);
+  nc_rc(nc_inq_ndims(fileId, &ndims), "nc_inq_ndims");
 
   std::vector<int> dimids(ndims);
-  nc_inq_dimids(fileId, &ndims, dimids.data(), 0);
+  nc_rc(nc_inq_dimids(fileId, &ndims, dimids.data(), 0), "nc_inq_dimids");
 
   // Create regular grid for determining lat/lon values
   // --------------------------------------------------
