@@ -47,12 +47,12 @@ static inline void nc_rc(const int return_code, const std::string & operation) {
 }
 
 static inline bool validMode(const std::string & mode) {
-  return mode == "read" || mode == "write" || mode == "both";
+  return mode == "read" || mode == "write";
 }
 
 static inline std::string validModeMessage(const std::string & mode) {
   return "IOStructuredGrid: invalid mode '" + mode
-       + "'. Expected one of: 'read', 'write', or 'both'.";
+       + "'. Expected one of: 'read' or 'write'.";
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -132,9 +132,8 @@ IOStructuredGrid::IOStructuredGrid(const Geometry & geom, const Parameters_ & pa
   // READ mode: build INPUT geometry from file
   // -------------------------
   if (params_.inputFilename.value() == boost::none) {
-    ABORT("IOStructuredGrid: mode is '" + mode
-          + "' but no input filename was specified. The 'input filename' option is required "
-          + "for read and both modes.");
+    ABORT("IOStructuredGrid: mode is 'read' but no input filename was specified. "
+          "The 'input filename' option is required for read mode.");
   }
   const std::string inFile = *params_.inputFilename.value();
 
@@ -145,21 +144,24 @@ IOStructuredGrid::IOStructuredGrid(const Geometry & geom, const Parameters_ & pa
     int ncid;
     nc_rc(nc_open(inFile.c_str(), NC_NOWRITE, &ncid), "nc_open " + inFile);
 
-    int dim_gridyt, dim_gridxt;
-    nc_rc(nc_inq_dimid(ncid, "grid_yt", &dim_gridyt), "nc_inq_dimid grid_yt");
-    nc_rc(nc_inq_dimlen(ncid, dim_gridyt, &nLat), "nc_inq_dimlen grid_yt");
-    nc_rc(nc_inq_dimid(ncid, "grid_xt", &dim_gridxt), "nc_inq_dimid grid_xt");
-    nc_rc(nc_inq_dimlen(ncid, dim_gridxt, &nLon), "nc_inq_dimlen grid_xt");
+    const std::string latName = params_.latName.value();
+    const std::string lonName = params_.lonName.value();
+
+    int dim_lat, dim_lon;
+    nc_rc(nc_inq_dimid(ncid, latName.c_str(), &dim_lat), "nc_inq_dimid " + latName);
+    nc_rc(nc_inq_dimlen(ncid, dim_lat, &nLat), "nc_inq_dimlen " + latName);
+    nc_rc(nc_inq_dimid(ncid, lonName.c_str(), &dim_lon), "nc_inq_dimid " + lonName);
+    nc_rc(nc_inq_dimlen(ncid, dim_lon, &nLon), "nc_inq_dimlen " + lonName);
 
     file_lats.resize(nLat);
     file_lons.resize(nLon);
 
-    int var_gridyt, var_gridxt;
-    nc_rc(nc_inq_varid(ncid, "grid_yt", &var_gridyt), "nc_inq_varid grid_yt");
-    nc_rc(nc_get_var_double(ncid, var_gridyt, file_lats.data()), "nc_get_var_double grid_yt");
+    int var_lat, var_lon;
+    nc_rc(nc_inq_varid(ncid, latName.c_str(), &var_lat), "nc_inq_varid " + latName);
+    nc_rc(nc_get_var_double(ncid, var_lat, file_lats.data()), "nc_get_var_double " + latName);
 
-    nc_rc(nc_inq_varid(ncid, "grid_xt", &var_gridxt), "nc_inq_varid grid_xt");
-    nc_rc(nc_get_var_double(ncid, var_gridxt, file_lons.data()), "nc_get_var_double grid_xt");
+    nc_rc(nc_inq_varid(ncid, lonName.c_str(), &var_lon), "nc_inq_varid " + lonName);
+    nc_rc(nc_get_var_double(ncid, var_lon, file_lons.data()), "nc_get_var_double " + lonName);
 
     nc_rc(nc_close(ncid), "nc_close");
 
@@ -178,9 +180,9 @@ IOStructuredGrid::IOStructuredGrid(const Geometry & geom, const Parameters_ & pa
 
   // Use an Atlas L-grid only as the structured indexing/distribution container.
   // In HAFS regional applications, the input is treated as a file-defined
-  // structured grid using explicit grid_xt/grid_yt coordinates. The exact source
-  // coordinates are supplied below through the lonlat field. Native F-grid support
-  // can be added later if needed.
+  // structured grid using explicit latitude/longitude coordinates from the input file.
+  // The exact source coordinates are supplied below through the lonlat field.
+  // Native F-grid support can be added later if needed.
   const std::string inputGridType = "L" + std::to_string(nLon) + "x" + std::to_string(nLat);
   const atlas::Grid inputGrid(inputGridType);
 
@@ -194,7 +196,7 @@ IOStructuredGrid::IOStructuredGrid(const Geometry & geom, const Parameters_ & pa
 
   readFunctionSpace_.reset(new atlas::functionspace::StructuredColumns(inputGrid, partitioner, atlas_conf));
 
-  // --- Override lonlat using file grid_xt/grid_yt ---
+  // --- Override lonlat using the configured input longitude/latitude coordinates ---
   atlas::FieldSet structuredAux;
 
   atlas::Field lonlat = readFunctionSpace_->createField<double>(
@@ -210,7 +212,7 @@ IOStructuredGrid::IOStructuredGrid(const Geometry & geom, const Parameters_ & pa
     lonlatView(p,1) = nan;
   }
 
-  // grid_yt is stored in the same row order as the NetCDF variables.
+  // The configured latitude coordinate is stored in the same row order as the NetCDF variables.
   // Therefore, the structured row index j is mapped directly to file_lats[j].
   // Do not flip north-to-south files here. Latitude orientation is handled
   // only when computing optional regional subset indices.
@@ -261,56 +263,6 @@ IOStructuredGrid::~IOStructuredGrid() {
   oops::Log::trace() << classname() << " destructor done" << std::endl;
 }
 
-// -------------------------------------------------------------------------------------------------
-void IOStructuredGrid::loadAkBkOnce_(int nLevModel) const {
-  std::call_once(akbk_once_, [&]() {
-    const int rank = geom_.getComm().rank();
-    if (params_.akbk.value() == boost::none) {
-      ABORT("IOStructuredGrid: 'akbk' must be specified for read/both mode vertical remapping");
-    }
-    const std::string coeffFile = *params_.akbk.value();
-    const size_t expect = static_cast<size_t>(nLevModel + 1);
-    int ncid;
-    nc_rc(nc_open(coeffFile.c_str(), NC_NOWRITE, &ncid), "nc_open " + coeffFile);
-    auto read_time_axis = [&](const char * varname, std::vector<double> & out) {
-      int varid;
-      nc_rc(nc_inq_varid(ncid, varname, &varid), std::string("nc_inq_varid ") + varname);
-      int ndims = 0;
-      nc_rc(nc_inq_varndims(ncid, varid, &ndims), std::string("nc_inq_varndims ") + varname);
-      if (ndims != 2) {
-        if (rank == 0) oops::Log::error() << varname << " is not 2D (Time,xaxis_1)" << std::endl;
-        ABORT(std::string(varname) + " wrong rank");
-      }
-      int dimids[NC_MAX_DIMS];
-      nc_rc(nc_inq_vardimid(ncid, varid, dimids), std::string("nc_inq_vardimid ") + varname);
-      size_t ntime = 0, naxis = 0;
-      nc_rc(nc_inq_dimlen(ncid, dimids[0], &ntime), std::string("nc_inq_dimlen Time for ") + varname);
-      nc_rc(nc_inq_dimlen(ncid, dimids[1], &naxis), std::string("nc_inq_dimlen xaxis_1 for ") + varname);
-      if (ntime < 1) ABORT(std::string(varname) + " has Time dim < 1");
-      if (naxis != expect) {
-        if (rank == 0) {
-          oops::Log::error() << varname << " axis length mismatch: expected "
-                             << expect << " got " << naxis << std::endl;
-        }
-        ABORT(std::string(varname) + " wrong axis length");
-      }
-      out.assign(expect, 0.0);
-      size_t start[2] = {0, 0};
-      size_t count[2] = {1, expect};
-      // Works even if stored as float; netCDF will convert to double.
-      nc_rc(nc_get_vara_double(ncid, varid, start, count, out.data()),
-            std::string("nc_get_vara_double ") + varname);
-    };
-    read_time_axis("ak", ak_);
-    read_time_axis("bk", bk_);
-    nc_rc(nc_close(ncid), "nc_close " + coeffFile);
-    akbk_nlev_model_ = nLevModel;
-  });
-  if (akbk_nlev_model_ != nLevModel) {
-    ABORT("ak/bk cache mismatch: different nLevModel than previously loaded");
-  }
-}
-
 void IOStructuredGrid::read(State & x,
                             const eckit::LocalConfiguration & fileionames,
                             const eckit::LocalConfiguration & fileioscaling) const {
@@ -330,11 +282,11 @@ void IOStructuredGrid::read(State & x,
 
   const std::string mode = (params_.mode.value() != boost::none) ? *params_.mode.value() : "write";
   if (mode == "write") {
-    ABORT("IOStructuredGrid::read(State) called with mode='write'. Use mode='read' or mode='both'.");
+    ABORT("IOStructuredGrid::read(State) called with mode='write'. Use mode='read'.");
   }
   if (params_.inputFilename.value() == boost::none) {
     ABORT("IOStructuredGrid::read(State): no input filename was specified. The 'input filename' "
-          "option is required for read and both modes.");
+          "option is required for read mode.");
   }
 
   const std::string inFile = *params_.inputFilename.value();
@@ -352,23 +304,27 @@ void IOStructuredGrid::read(State & x,
     int ncid;
     nc_rc(nc_open(inFile.c_str(), NC_NOWRITE, &ncid), "nc_open " + inFile);
 
-    int dim_gridyt, dim_gridxt, dim_pfull;
-    nc_rc(nc_inq_dimid(ncid, "grid_yt", &dim_gridyt), "nc_inq_dimid grid_yt");
-    nc_rc(nc_inq_dimlen(ncid, dim_gridyt, &nLat), "nc_inq_dimlen grid_yt");
-    nc_rc(nc_inq_dimid(ncid, "grid_xt", &dim_gridxt), "nc_inq_dimid grid_xt");
-    nc_rc(nc_inq_dimlen(ncid, dim_gridxt, &nLon), "nc_inq_dimlen grid_xt");
+    const std::string latName = params_.latName.value();
+    const std::string lonName = params_.lonName.value();
+    const std::string levName = params_.levName.value();
 
-    nc_rc(nc_inq_dimid(ncid, "pfull", &dim_pfull), "nc_inq_dimid pfull");
-    nc_rc(nc_inq_dimlen(ncid, dim_pfull, &nLevFile), "nc_inq_dimlen pfull");
+    int dim_lat, dim_lon, dim_lev;
+    nc_rc(nc_inq_dimid(ncid, latName.c_str(), &dim_lat), "nc_inq_dimid " + latName);
+    nc_rc(nc_inq_dimlen(ncid, dim_lat, &nLat), "nc_inq_dimlen " + latName);
+    nc_rc(nc_inq_dimid(ncid, lonName.c_str(), &dim_lon), "nc_inq_dimid " + lonName);
+    nc_rc(nc_inq_dimlen(ncid, dim_lon, &nLon), "nc_inq_dimlen " + lonName);
+
+    nc_rc(nc_inq_dimid(ncid, levName.c_str(), &dim_lev), "nc_inq_dimid " + levName);
+    nc_rc(nc_inq_dimlen(ncid, dim_lev, &nLevFile), "nc_inq_dimlen " + levName);
 
     file_lats.resize(nLat);
     file_lons.resize(nLon);
 
-    int var_gridyt, var_gridxt;
-    nc_rc(nc_inq_varid(ncid, "grid_yt", &var_gridyt), "nc_inq_varid grid_yt");
-    nc_rc(nc_get_var_double(ncid, var_gridyt, file_lats.data()), "nc_get_var grid_yt");
-    nc_rc(nc_inq_varid(ncid, "grid_xt", &var_gridxt), "nc_inq_varid grid_xt");
-    nc_rc(nc_get_var_double(ncid, var_gridxt, file_lons.data()), "nc_get_var grid_xt");
+    int var_lat, var_lon;
+    nc_rc(nc_inq_varid(ncid, latName.c_str(), &var_lat), "nc_inq_varid " + latName);
+    nc_rc(nc_get_var_double(ncid, var_lat, file_lats.data()), "nc_get_var " + latName);
+    nc_rc(nc_inq_varid(ncid, lonName.c_str(), &var_lon), "nc_inq_varid " + lonName);
+    nc_rc(nc_get_var_double(ncid, var_lon, file_lons.data()), "nc_get_var " + lonName);
 
     fileNorthToSouth_i = (nLat >= 2 && file_lats[0] > file_lats[nLat - 1]) ? 1 : 0;
 
@@ -511,15 +467,25 @@ void IOStructuredGrid::read(State & x,
   const int nLevModel = (tField.rank() >= 2) ? static_cast<int>(tField.shape(1)) : 1;
 
   if (rank == 0) {
-    oops::Log::info() << "[CHECK-NLEV] file pfull=" << nLevFile
+    oops::Log::info() << "[CHECK-NLEV] file " << params_.levName.value() << "=" << nLevFile
                       << " model levels=" << nLevModel << std::endl;
   }
   if (nLevModel <= 1) ABORT("Model State appears not to have 3D levels (nLevModel<=1)");
 
   // ============================================================
-  // 3) Load ak/bk once (target model coordinate)
+  // 3) Get target ak/bk from the FV3 Geometry
   // ============================================================
-  loadAkBkOnce_(nLevModel);
+  const std::vector<double> & ak = geom_.ak();
+  const std::vector<double> & bk = geom_.bk();
+  const size_t nLevModelP1 = static_cast<size_t>(nLevModel + 1);
+  if (ak.size() != nLevModelP1 || bk.size() != nLevModelP1) {
+    if (rank == 0) {
+      oops::Log::error() << "Geometry ak/bk size mismatch: expected "
+                         << nLevModelP1 << " got ak=" << ak.size()
+                         << " bk=" << bk.size() << std::endl;
+    }
+    ABORT("Geometry ak/bk size mismatch");
+  }
 
   // ============================================================
   // 4) Variable mapping
@@ -573,74 +539,64 @@ void IOStructuredGrid::read(State & x,
     ABORT("State missing air_pressure_at_surface");
   }
 
-  const std::string dpresName = "__dpres__";
-  const std::string psName    = "__pressfc__";
+  const std::string dpresName = "__pressure_thickness__";
+  const std::string psName    = "__surface_pressure__";
 
-  // VertRemap path for terrain/orography-aware adjustment.
-  // If the required source or target orography fields are unavailable,
-  // fall back to the existing pressure-space
-  // log-p remap rather than aborting. No local simplified hydrostatic or
-  // lapse-rate approximation is added here.
+  auto requiredFileName = [&](const std::string & fieldName,
+                              const std::string & purpose) -> std::string {
+    const auto it = ioNameMap.find(fieldName);
+    if (it == ioNameMap.end()) {
+      ABORT("IOStructuredGrid::read(State): field io names must define '" + fieldName
+            + "' for " + purpose + ".");
+    }
+    return it->second;
+  };
+
+  const std::string dpresFileName =
+      requiredFileName("air_pressure_thickness", "source pressure thickness");
+  const std::string psFileName =
+      requiredFileName("air_pressure_at_surface", "source surface pressure");
+
   const std::string orogName = "geopotential_height_at_surface";
-  std::string sourceOrogFileName = "hgtsfc";
-  if (ioNameMap.count(orogName) > 0) sourceOrogFileName = ioNameMap[orogName];
+  const bool doVertRemap = params_.doVerticalRemapping.value();
+  std::string sourceOrogFileName;
+  atlas::FieldSet fieldsOrog;
 
-  bool hasSourceOrogFile = false;
-  {
+  if (doVertRemap) {
+    sourceOrogFileName = requiredFileName(orogName, "source orography for VertRemap");
+
     int ncid_check;
     nc_rc(nc_open(inFile.c_str(), NC_NOWRITE, &ncid_check),
           "nc_open for source orography check " + inFile);
     int varid_check;
-    hasSourceOrogFile = (nc_inq_varid(ncid_check, sourceOrogFileName.c_str(), &varid_check) == NC_NOERR);
+    const int orog_rc = nc_inq_varid(ncid_check, sourceOrogFileName.c_str(), &varid_check);
     nc_rc(nc_close(ncid_check), "nc_close source orography check");
-  }
-
-  // Target/model orography for VertRemap.
-  // Do NOT read geopotential_height_at_surface from FMS restart files here.
-  // In read mode, prefer the model Geometry FieldSet, but also allow a
-  // fallback to the State FieldSet if the field has already been materialized
-  // there (for example by Vader or an earlier variable change path).
-  // It is not requested through sfc_data.
-  //
-  // This avoids the incorrect lookup:
-  //   sfc_data.* variable: geopotential_height_at_surface
-  // which can abort before fallback is reached.
-  atlas::FieldSet fieldsOrog;
-  bool hasTargetOrogField = false;
-  std::string targetOrogSource = "";
-
-  if (geom_.fields().has(orogName)) {
-    atlas::Field zsOrogTarget = geom_.fields().field(orogName).clone();
-    zsOrogTarget.rename(orogName);
-    fieldsOrog.add(zsOrogTarget);
-    hasTargetOrogField = true;
-    targetOrogSource = "Geometry fields";
-  } else if (fieldsModelAll.has(orogName)) {
-    atlas::Field zsOrogTarget = fieldsModelAll.field(orogName).clone();
-    zsOrogTarget.rename(orogName);
-    fieldsOrog.add(zsOrogTarget);
-    hasTargetOrogField = true;
-    targetOrogSource = "State FieldSet";
-  }
-
-  const bool doVertRemap = hasTargetOrogField && hasSourceOrogFile;
-  if (rank == 0) {
-    if (doVertRemap) {
-      oops::Log::info() << "[VERT-REMAP] VertRemap enabled by default in read mode using source "
-                        << sourceOrogFileName << " and target " << orogName
-                        << " from " << targetOrogSource << std::endl;
-    } else {
-      oops::Log::info() << "[VERT-REMAP] VertRemap fallback in read mode: ";
-      if (!hasTargetOrogField) {
-        oops::Log::info() << "target field '" << orogName
-                          << "' is missing from Geometry fields and State FieldSet; ";
-      }
-      if (!hasSourceOrogFile) {
-        oops::Log::info() << "source field '" << sourceOrogFileName << "' is missing from "
-                          << inFile << "; ";
-      }
-      oops::Log::info() << "using pressure-space log-p remap only." << std::endl;
+    if (orog_rc != NC_NOERR) {
+      ABORT("IOStructuredGrid::read(State): source orography variable '"
+            + sourceOrogFileName + "' was requested for VertRemap but is not present in "
+            + inFile + ".");
     }
+
+    if (geom_.fields().has(orogName)) {
+      atlas::Field zsOrogTarget = geom_.fields().field(orogName).clone();
+      zsOrogTarget.rename(orogName);
+      fieldsOrog.add(zsOrogTarget);
+    } else if (fieldsModelAll.has(orogName)) {
+      atlas::Field zsOrogTarget = fieldsModelAll.field(orogName).clone();
+      zsOrogTarget.rename(orogName);
+      fieldsOrog.add(zsOrogTarget);
+    } else {
+      ABORT("IOStructuredGrid::read(State): do vertical remapping is true, but target field '"
+            + orogName + "' is missing from Geometry fields and State FieldSet.");
+    }
+
+    if (rank == 0) {
+      oops::Log::info() << "[VERT-REMAP] VertRemap enabled in read mode using source "
+                        << sourceOrogFileName << " and target " << orogName << std::endl;
+    }
+  } else if (rank == 0) {
+    oops::Log::info() << "[VERT-REMAP] VertRemap disabled in read mode; "
+                      << "using pressure-space log-p remap only." << std::endl;
   }
 
   // ============================================================
@@ -703,8 +659,8 @@ void IOStructuredGrid::read(State & x,
   for (const auto & v : vars3d) {
     all_vars.push_back({v.fileName, v.stateName, static_cast<int>(nLevFile), true});
   }
-  all_vars.push_back({"dpres", dpresName, static_cast<int>(nLevFile), true});
-  all_vars.push_back({"pressfc", psName, 1, false});
+  all_vars.push_back({dpresFileName, dpresName, static_cast<int>(nLevFile), true});
+  all_vars.push_back({psFileName, psName, 1, false});
   if (doVertRemap) {
     all_vars.push_back({sourceOrogFileName, orogName, 1, false});
   }
@@ -923,7 +879,7 @@ void IOStructuredGrid::read(State & x,
       }
 
       for (int k = 0; k <= nLevModel; ++k) {
-        p_int_tgt[k] = ak_[k] + bk_[k] * ps_col;
+        p_int_tgt[k] = ak[k] + bk[k] * ps_col;
         if (p_int_tgt[k] < 1.0) p_int_tgt[k] = 1.0;
       }
       for (int k = 0; k < nLevModel; ++k) {
@@ -982,8 +938,8 @@ void IOStructuredGrid::read(State & x,
 
   if (tgtModelRemapped.has("air_pressure_at_surface")) {
     // In the VertRemap path this is the terrain-adjusted surface pressure
-    // returned by VertRemap. In the fallback path this field is absent, so the
-    // State receives the horizontally interpolated source surface pressure below.
+    // returned by VertRemap. If VertRemap is disabled, this field is absent, so
+    // the State receives the horizontally interpolated source surface pressure below.
     auto psRemapped = atlas::array::make_view<double, 2>(
       tgtModelRemapped.field("air_pressure_at_surface"));
     for (atlas::idx_t p = 0; p < psState.shape(0); ++p) {
@@ -1003,36 +959,6 @@ void IOStructuredGrid::read(State & x,
   auto t_from0 = clock_t::now();
   x.fromFieldSet(fieldsModelAll);
   log0t("[TIMER] fromFieldSet: ", sec(t_from0, clock_t::now()));
-
-  // ============================================================
-  // 11) If mode=="both", write interpolated state as fms restart
-  // ============================================================
-  if (mode == "both") {
-    if (params_.output_datapath.value() == boost::none) {
-      ABORT("IOStructuredGrid: mode is 'both' but no output datapath specified");
-    }
-    if (params_.output_filename_core.value() == boost::none ||
-        params_.output_filename_trcr.value() == boost::none ||
-        params_.output_filename_sfcd.value() == boost::none ||
-        params_.output_filename_sfcw.value() == boost::none ||
-        params_.output_filename_cplr.value() == boost::none) {
-      ABORT("IOStructuredGrid: mode is 'both' but one or more output restart filenames are missing");
-    }
-    auto t_write0 = clock_t::now();
-    eckit::LocalConfiguration outputConfig;
-    outputConfig.set("filetype", "fms restart");
-    outputConfig.set("datapath", *params_.output_datapath.value());
-    outputConfig.set("filename_core", *params_.output_filename_core.value());
-    outputConfig.set("filename_trcr", *params_.output_filename_trcr.value());
-    outputConfig.set("filename_sfcd", *params_.output_filename_sfcd.value());
-    outputConfig.set("filename_sfcw", *params_.output_filename_sfcw.value());
-    outputConfig.set("filename_cplr", *params_.output_filename_cplr.value());
-    if (params_.output_field_io_names.value() != boost::none) {
-      outputConfig.set("field io names", *params_.output_field_io_names.value());
-    }
-    x.write(outputConfig);
-    log0t("[TIMER] write fms restart: ", sec(t_write0, clock_t::now()));
-  }
 
   log0t("[TIMER] TOTAL read(): ", sec(t_total0, clock_t::now()));
 }

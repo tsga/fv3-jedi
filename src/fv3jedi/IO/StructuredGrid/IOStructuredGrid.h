@@ -10,8 +10,6 @@
 #include <memory>
 #include <ostream>
 #include <string>
-#include <mutex>
-#include <vector>
 
 #include "atlas/field.h"
 
@@ -35,7 +33,7 @@ class IOStructuredGridParameters : public IOParametersBase {
  public:
   // Type of structured grid to write
   oops::Parameter<std::string> outputGridType{"gridtype", "gridtype", "F12", this};
-  oops::OptionalParameter<std::string> mode{"mode", "read/write/both", this};
+  oops::OptionalParameter<std::string> mode{"mode", "read/write", this};
 
   // Filename of output
   oops::Parameter<std::string> filename{"filename", "filename",
@@ -45,35 +43,6 @@ class IOStructuredGridParameters : public IOParametersBase {
   oops::OptionalParameter<std::string> inputFilename{"input filename",
                                                      "input NetCDF filename for read()",
                                                      this};
-
-  // Filename of input (for reading external structured-grid files)
-  oops::OptionalParameter<std::string> akbk{"akbk",
-                                            "Filename containing target hybrid coefficients ak/bk",
-                                            this};
-
-  // Output fms restart parameters (for mode="both")
-  oops::OptionalParameter<std::string> output_datapath{"output datapath",
-                                                       "output datapath for fms restart write",
-                                                       this};
-  oops::OptionalParameter<std::string> output_filename_core{"output filename_core",
-                                                            "output fv_core restart filename",
-                                                            this};
-  oops::OptionalParameter<std::string> output_filename_trcr{"output filename_trcr",
-                                                            "output fv_tracer restart filename",
-                                                            this};
-  oops::OptionalParameter<std::string> output_filename_sfcd{"output filename_sfcd",
-                                                            "output sfc_data restart filename",
-                                                            this};
-  oops::OptionalParameter<std::string> output_filename_sfcw{"output filename_sfcw",
-                                                            "output fv_srf_wnd restart filename",
-                                                            this};
-  oops::OptionalParameter<std::string> output_filename_cplr{"output filename_cplr",
-                                                            "output coupler restart filename",
-                                                            this};
-  oops::OptionalParameter<eckit::LocalConfiguration> output_field_io_names{
-                                                            "output field io names",
-                                                            "field name mapping for fms restart write",
-                                                            this};
 
   // Flag to indicate whether to remap vertical coordinates based on orography
   oops::Parameter<bool> doVerticalRemapping{"do vertical remapping",
@@ -152,11 +121,6 @@ class IOStructuredGrid : public IOBase, private util::ObjectCounter<IOStructured
   std::unique_ptr<atlas::functionspace::StructuredColumns> writeFunctionSpace_;
   mutable std::unique_ptr<atlas::functionspace::StructuredColumns> readFunctionSpace_;  // mutable: used in read()
   atlas::Field readLonLat_;
-  void loadAkBkOnce_(int nLevModel) const;
-  mutable std::once_flag akbk_once_;
-  mutable std::vector<double> ak_;   // size = nLevModel+1
-  mutable std::vector<double> bk_;   // size = nLevModel+1
-  mutable int akbk_nlev_model_ = -1;
 };
 
 // -------------------------------------------------------------------------------------------------
