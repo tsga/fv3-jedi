@@ -38,6 +38,51 @@ static inline void nc_rc(const int return_code, const std::string & operation) {
   }
 }
 
+IOStructuredGrid::IOStructuredGrid(const Geometry & geom, const Parameters_ & params) 
+  : IOBase(geom, params.toConfiguration()), geom_(geom), params_(params) {
+    
+    // 1. All ranks participate natively in the parallel layout built during initialization
+    // 2. No `writeFunctionSpace_` or `interpolator_` members needed!
+    oops::Log::trace() << classname() << " Constructor configured for pure geographic space." << std::endl;
+}
+
+void IOStructuredGrid::read(State & x, const eckit::LocalConfiguration & fileionames,
+                            const eckit::LocalConfiguration & fileioscaling) const {
+  util::Timer timer(classname(), "read state");
+
+  // 1. Gather a local reference to the distributed geographic fieldset
+  atlas::FieldSet fieldsGeographic;
+  x.toFieldSet(fieldsGeographic);
+
+  // 2. Allocate a temporary serial FieldSet for Rank 0 disk access
+  // (Assuming you instantiate a flat serial space container `serialSpace_` in your class)
+  atlas::FieldSet fieldsSerial;
+  if (geom_.getComm().rank() == 0) {
+    for (const auto & field : fieldsGeographic) {
+      atlas::Field fSerial = serialSpace_->createField<double>(
+          atlas::option::name(field.name()) | atlas::option::levels(field.levels()));
+      fieldsSerial.add(fSerial);
+    }
+  }
+
+  // 3. Extract the target array profiles from configuration parameters
+  const auto & filenamesOpt = params_.filenames.value();
+  if (filenamesOpt != boost::none) {
+    for (const auto & filename : filenamesOpt.value()) {
+      if (geom_.getComm().rank() == 0) {
+        this->readStructuredFields(params_.datapath.value() + "/" + filename, 
+                                   fieldsSerial, x.validTime(), fileionames, fileioscaling);
+      }
+    }
+  }
+
+  // 4. Distribute data directly via Atlas's built-in parallel grid scatter 
+  readFunctionSpace_->scatter(fieldsSerial, fieldsGeographic);
+
+  // 5. Update State buffers directly without computing global interpolations
+  x.fromFieldSet(fieldsGeographic);
+}
+
 IOStructuredGrid::IOStructuredGrid(const Geometry & geom, const Parameters_ & params)
   : IOBase(geom, params.toConfiguration()), interpolator_(), readInterpolator_(), geom_(geom),
     gridStr_(""), params_(params), writeFunctionSpace_(), readFunctionSpace_()  {
@@ -52,7 +97,7 @@ IOStructuredGrid::IOStructuredGrid(const Geometry & geom, const Parameters_ & pa
   // Convert the legacy gridtype to what Atlas expects
   if (outputGridType == "latlon") {
     outputGridType = "L" + std::to_string(4*(geom.npx()-1)) + "x" +
-                     std::to_string(2*(geom.npy()-1));  //std::to_string(2*(geom.npy()-1)+1);
+                     std::to_string(2*(geom.npy()-1)+1);
   } else if (outputGridType == "gaussian") {
     // Find best matching Gaussian grid
     outputGridType = "F" + std::to_string(geom.npy()-1);

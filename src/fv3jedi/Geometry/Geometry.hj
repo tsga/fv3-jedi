@@ -1,0 +1,147 @@
+/*
+ * (C) Copyright 2026 UCAR
+ *
+ * This software is licensed under the terms of the Apache Licence Version 2.0
+ * which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+ */
+
+#pragma once
+
+#include <cstddef>
+#include <ostream>
+#include <string>
+#include <vector>
+
+#include "eckit/mpi/Comm.h"
+
+#include "atlas/field.h"
+#include "atlas/functionspace.h"
+#include "atlas/grid.h"
+
+#include "oops/mpi/mpi.h"
+#include "oops/util/ObjectCounter.h"
+#include "oops/util/Printable.h"
+
+#include "fv3jedi/Geometry/base/GeometryBase.h"
+
+#include "fv3jedi/FieldMetadata/FieldsMetadata.h"
+#include "fv3jedi/Geometry/Geometry.interface.h"
+#include "fv3jedi/GeometryIterator/GeometryIterator.h"
+
+namespace oops {
+  class Variables;
+}
+
+namespace eckit
+{
+  class Configuration;
+}
+
+namespace fv3jedi
+{
+  class GeometryIterator;
+
+  // GSIBEC (background error covariance) geometry that builds an atlas FunctionSpace
+  // directly from a YAML grid description. Mirrors saber::interpolation::Geometry:
+  // a GSI-matching custom grid + checkerboard partitioner path.
+  class Geometry //: public GeometryBase
+  {
+   public:
+    Geometry(const eckit::Configuration &, const eckit::mpi::Comm &,
+                   eckit::LocalConfiguration &, atlas::FunctionSpace &,
+                   atlas::FieldSet &, bool &, int &);
+
+    explicit Geometry(const eckit::Configuration &, const eckit::mpi::Comm &);
+    Geometry(const Geometry &);
+    
+    ~Geometry(){
+      //fv3jedi_geom_delete_f90(keyGeom_);
+    }
+
+    std::vector<double> verticalCoord(std::string &) const; // override;
+
+    static std::shared_ptr<Geometry> create(const eckit::Configuration &geomConf,
+                                                     const eckit::mpi::Comm &comm,
+                                                     eckit::LocalConfiguration &geomVars,
+                                                     atlas::FunctionSpace &functionSpace,
+                                                     atlas::FieldSet &fieldSet,
+                                                     bool &levelsAreTopDown, int &numLevels)
+    {
+      return std::make_shared<Geometry>(geomConf, comm, geomVars, functionSpace, fieldSet,
+                                              levelsAreTopDown, numLevels);
+    }
+
+    Geometry & operator=(const Geometry &) = delete;
+
+    // For use by other fv3jedi code
+    bool isEqual(const Geometry &) const;
+
+    bool levelsAreTopDown() const {return true;}
+
+    GeometryIterator begin() const;
+    GeometryIterator end() const;
+
+    F90geom & toFortran() {return keyGeom_;}
+    const F90geom & toFortran() const {return keyGeom_;}
+    const eckit::mpi::Comm & getComm() const {return comm_;}
+    const atlas::FunctionSpace & functionSpace() const {return functionSpace_;}
+    const atlas::FieldSet & fields() const {return fields_;}
+
+    int tileNum() const {return tileNum_;}
+    std::vector<int> get_indices() const {
+      int ist, iend, jst, jend, kst, kend, npz;
+      std::vector<int> indices;
+      fv3jedi_geom_start_end_f90(keyGeom_, ist, iend, jst, jend, kst, kend, npz);
+      return std::vector<int>{{ist, iend, jst, jend, kst, kend, npz}};
+    }
+
+    const FieldsMetadata & fieldsMetaData() const {return *fieldsMeta_;}
+
+    std::vector<size_t> variableSizes(const oops::Variables & vars) const {
+      // Array of level heights
+      std::vector<size_t> varSizes;
+      // Loop through arrays and search metadata map for the levels
+      for (size_t it = 0; it < vars.size(); it++) {
+        varSizes.push_back(fieldsMeta_->getLevels(vars[it].name()));
+      }
+      return varSizes;
+    }
+
+    // Functions to retrieve geometry features
+    const std::vector<double> & ak() const {return ak_;}
+    const std::vector<double> & bk() const {return bk_;}
+    const double & pTop() const {return pTop_;}
+    const int & npx() const {return npx_;}
+    const int & npy() const {return npy_;}
+    const int & npz() const {return npz_;}
+
+    const bool & doVerticalRemapping() const {return doVerticalRemapping_;}
+  
+
+   private:
+    void print(std::ostream &) const;  // override;
+
+    const eckit::mpi::Comm & comm_;
+    int numLevels_ = 1;
+    std::size_t halo_ = 1;
+    atlas::Grid grid_;
+    atlas::grid::Partitioner partitioner_;
+    atlas::FunctionSpace functionSpace_;
+
+  
+    F90geom keyGeom_;
+    atlas::FieldSet fields_;
+    eckit::LocalConfiguration fieldMasks_;
+    std::shared_ptr<FieldsMetadata> fieldsMeta_;
+    std::vector<double> ak_;
+    std::vector<double> bk_;
+    int tileNum_;
+    int npx_;
+    int npy_;
+    int npz_;
+    double pTop_;
+    bool doVerticalRemapping_;
+
+  };
+
+}  // namespace fv3jedi

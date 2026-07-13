@@ -33,29 +33,16 @@ class IOStructuredGridParameters : public IOParametersBase {
  public:
   // Type of structured grid to write
   oops::Parameter<std::string> outputGridType{"gridtype", "gridtype", "F12", this};
-  oops::Parameter<std::string> mode{"mode", "read/write", "write", this};
+  oops::OptionalParameter<std::string> mode{"mode", "read/write", this};
 
-  // Filenames provided as a list for input
-  oops::OptionalParameter<std::vector<std::string>> filenames{"filenames",
-                                                              "names of the files to be read",
-                                                              this};
   // Filename of output
-  oops::Parameter<std::string> filename{"filename", "filename",  
+  oops::Parameter<std::string> filename{"filename", "filename",
                                         "cube_to_geometric_%Y%m%dT%H%M%S.nc4", this};
-
-  // Filename of geom input (for reading external structured-grid files)
-  oops::OptionalParameter<std::string> geomfilename{"geom filename",
-                                                     "geometry NetCDF filename for read()",
-                                                     this};
 
   // Filename of input (for reading external structured-grid files)
   oops::OptionalParameter<std::string> inputFilename{"input filename",
                                                      "input NetCDF filename for read()",
                                                      this};
-
-    // Path prepended to all files
-  oops::Parameter<std::string> datapath{"datapath", "path to location of files to be read",
-                                        "./", this};
 
   // Flag to indicate whether to remap vertical coordinates based on orography
   oops::Parameter<bool> doVerticalRemapping{"do vertical remapping",
@@ -84,12 +71,10 @@ class IOStructuredGridParameters : public IOParametersBase {
                                       this};
 
   // Dimension names
-  oops::Parameter<std::string> latName{"latitude dim name", "latitude dim name", "grid_yt", this};
-  oops::Parameter<std::string> lonName{"longitude dim name", "longitude dim name", "grid_xt", this};
-  oops::Parameter<std::string> latvarName{"latitude var name", "latitude var name", "lat", this};
-  oops::Parameter<std::string> lonvarName{"longitude var name", "longitude var name", "lon", this};
-  oops::Parameter<std::string> levName{"level dim name", "level dim name", "pfull", this};
-  oops::Parameter<std::string> edgName{"edge dim name", "edge dim name", "phalf", this};  //TODO: this may be wrong
+  oops::Parameter<std::string> latName{"latitude dim name", "latitude dim name", "lat", this};
+  oops::Parameter<std::string> lonName{"longitude dim name", "longitude dim name", "lon", this};
+  oops::Parameter<std::string> levName{"level dim name", "level dim name", "lev", this};
+  oops::Parameter<std::string> edgName{"edge dim name", "edge dim name", "edge", this};
   oops::Parameter<std::string> forName{"four level dim name", "four level dim name", "four", this};
   oops::Parameter<std::string> timName{"time dim name", "time dim name", "time", this};
 };
@@ -129,7 +114,6 @@ class IOStructuredGrid : public IOBase, private util::ObjectCounter<IOStructured
 
   // Data
   std::unique_ptr<oops::GlobalInterpolator> interpolator_;
-  mutable std::unique_ptr<oops::GlobalInterpolator> readInterpolator_;
   mutable std::unique_ptr<oops::GlobalInterpolator> interpolatorBack_;  // mutable: created in read()
   const Geometry & geom_;
   std::string gridStr_;
